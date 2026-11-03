@@ -48,21 +48,22 @@ Vue 3 / TypeScript / Vben / Naive UI
 | 后端 | Python、FastAPI、Pydantic |
 | 存储 | SQLite（WAL）、本地私有文件目录 |
 | 推理 | ComfyUI、MOSS-Image 固定工作流、PyTorch / CUDA |
-| 本地运行 | Windows PowerShell、独立 Python 环境、Node.js |
+| 本地运行 | Windows PowerShell、conda 环境 `image_generation`、Node.js |
 
 ## 目录结构
 
 ```text
-text-to-image/
+ImageGeneration/
 ├── platform/
 │   ├── backend/            # 业务 API、鉴权、数据库、worker、推理适配
 │   ├── frontend/
 │   │   ├── apps/moss/      # 应用页面与前端测试
 │   │   └── packages/      # Vben 上游基础组件与工具
 │   ├── tests/             # 接口、引擎与浏览器验收脚本
-│   ├── tools/             # 进程管理、兼容运行库与交付工具
+│   ├── tools/             # 进程管理
 │   ├── requirements-lock.txt
 │   └── serve.py           # 后端入口
+├── models/                 # 仅模型说明文档，权重不入库
 ├── start.bat              # Windows 启动入口
 ├── start-platform.ps1     # 前后端启动与重启
 ├── run_moss_compatible.py # 推理兼容入口
@@ -70,7 +71,7 @@ text-to-image/
 └── workflow-api*.json     # 固定 API 工作流
 ```
 
-模型、缓存、运行日志、虚拟环境及用户数据通过 `.gitignore` 排除。本地教程和笔记保留在开发机器，不随仓库发布；仓库只保留本页 Markdown 说明。
+模型、缓存、运行日志、虚拟环境及用户数据通过 `.gitignore` 排除。仓库只保留本页说明与 `models/模型说明.md`；模型权重统一部署在 GPU 主机，不随仓库分发。
 
 ## 部署准备
 
@@ -86,19 +87,19 @@ text-to-image/
 ### 2. 获取源码
 
 ```powershell
-git clone https://github.com/345488485/text-to-image.git
-Set-Location text-to-image
+git clone https://github.com/345488485/text-to-image.git ImageGeneration
+Set-Location ImageGeneration
 ```
 
-后续命令均在项目根目录执行。部分脚本保留了开发机路径，例如 `D:\Anaconda3`、`E:\nodejs`；换机器时需要检查并调整，不能直接假设这些位置存在。
+后续命令均在项目根目录执行。启动脚本的解释器路径可用环境变量覆盖：`MOSS_PYTHON` 控制后端，`MOSS_INFERENCE_PYTHON` 控制推理子进程；本机默认指向 conda 环境 `image_generation`。
 
 ### 3. 准备推理环境与模型
 
-推理与业务 Python 环境应隔离：根目录 `.venv` 用于推理，`platform/.venv` 用于业务服务。
+推理与业务依赖安装在同一个 conda 环境（Python 3.12）中，避免两套解释器带来的路径与版本漂移；权重不落本机，统一部署在 GPU 主机（autoDL），接入方式见 `models/模型说明.md`。
 
-请按照对应模型发布方的说明准备匹配版本的 ComfyUI、PyTorch 与量化依赖，并核对许可证、格式和校验值。ComfyUI 源码应放在兼容入口所引用的 `.runtime/source/ComfyUI-master`。本仓库不提供一条命令完成模型部署的承诺。
+ComfyUI 源码应放在兼容入口所引用的 `.runtime/source/ComfyUI-master`。本仓库不提供一条命令完成模型部署的承诺。
 
-当前工作流使用以下权重：
+当前工作流使用以下权重（部署到 GPU 主机时目录结构需保持一致）：
 
 | 目录 | 文件 |
 | --- | --- |
@@ -106,21 +107,27 @@ Set-Location text-to-image
 | `models/diffusion_models/` | `moss_image_sft_int8_convrot.safetensors` |
 | `models/vae/` | `flux2-vae_small.safetensors` |
 
-修改 `extra_model_paths.yaml` 中的 `base_path`，使其指向本机实际模型目录。不要将权重提交到 Git。
+本机 `extra_model_paths.yaml` 仅在本地启动引擎时生效；GPU 主机需同步一份并调整 `base_path`。不要将权重提交到 Git。
 
 **先确认模型端能用固定工作流生成一张可读取的 PNG，再继续业务联调。端口可连接不代表模型已成功加载。**
 
 ### 4. 安装业务与前端依赖
 
-以下命令使用本机已安装、可执行的 `python`。仅在目标虚拟环境尚未创建时执行第一条：
-
 ```powershell
-python -m venv --without-pip .\platform\.venv
-python -m pip --python .\platform\.venv\Scripts\python.exe install -r .\platform\requirements-lock.txt
+conda create -n image_generation python=3.12 -y
+conda activate image_generation
+
+# PyTorch（cu128）
+python -m pip install torch==2.9.1+cu128 torchvision==0.24.1+cu128 --index-url https://download.pytorch.org/whl/cu128
+# 推理依赖；清华镜像缺新包时补充官方源
+python -m pip install -r .\.runtime\source\ComfyUI-master\requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --extra-index-url https://pypi.org/simple
+# 业务依赖
+python -m pip install -r .\platform\requirements-lock.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 前端
 pnpm.cmd --dir .\platform\frontend install --frozen-lockfile
 ```
 
-如果基础 Python 没有 pip，应先准备可用的 pip；不要将业务依赖直接安装到全局推理环境。
+安装顺序固定：PyTorch 先装，再装推理依赖，最后装业务锁定依赖。业务锁定文件会把 `pillow`、`pydantic` 降到固定版本，先装推理依赖可避免装完业务依赖后推理侧缺包。
 
 ## 运行
 
@@ -134,7 +141,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start-platform.ps1
 | --- | --- |
 | `http://127.0.0.1:5173/` | 前端工作台 |
 | `http://127.0.0.1:8000/` | 业务后端 |
-| `http://127.0.0.1:8188/` | 本地推理引擎 |
+| `http://127.0.0.1:8188/` | 推理引擎（本机或 autoDL，见 `models/模型说明.md`） |
 
 - 空数据库首次启动会创建 `admin / 123456`，登录后必须修改密码；已有账号密码不会被启动操作覆盖。
 - 不要并行启动多个后端 worker。单 GPU 串行方案不支持通过多开服务提升生成并发。
@@ -174,7 +181,7 @@ pnpm.cmd --dir .\platform\frontend --filter @moss/studio build
 
 ```powershell
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-& .\platform\.venv\Scripts\python.exe -m pytest .\platform\tests -q --basetemp ".\platform\.test-runs\manual-$stamp"
+& python -m pytest .\platform\tests -q --basetemp ".\platform\.test-runs\manual-$stamp"
 ```
 
 测试目录应使用新的名称，避免覆盖旧记录。部分浏览器验收脚本使用开发机上的 Playwright 路径，其他机器需要调整。

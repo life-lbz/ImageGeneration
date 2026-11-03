@@ -1,5 +1,5 @@
 moss_local:
-  base_path: F:/uv/text-to-image/models
+  base_path: D:/ProjectAll/trae_case/ImageGeneration/models
   diffusion_models: diffusion_models
   text_encoders: text_encoders
   vae: vae

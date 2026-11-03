@@ -5,10 +5,10 @@ import logging
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
+import sys
 import time
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, ProxyHandler, build_opener
 import uuid
@@ -32,8 +32,11 @@ class ComfyEngine:
     def __init__(self, settings):
         self.settings = settings
         parsed = urlparse(settings.engine_url)
-        if parsed.scheme != 'http' or parsed.hostname not in ('127.0.0.1', 'localhost') or parsed.username or parsed.password or parsed.path not in ('', '/'):
-            raise ValueError('Inference endpoint must be local HTTP')
+        if (parsed.scheme not in ('http', 'https') or not parsed.hostname
+                or parsed.username or parsed.password or parsed.path not in ('', '/')):
+            raise ValueError('Inference endpoint must be an HTTP(S) origin without credentials or path')
+        # 远程引擎（autoDL / SSH 隧道之外的直连）不再从本地 output 目录取图，改为 /view 下载
+        self._remote = parsed.hostname not in ('127.0.0.1', 'localhost', '::1')
         self._http = build_opener(ProxyHandler({}))
         self._process = None
         self._has_generated = False
@@ -45,7 +48,7 @@ class ComfyEngine:
         body = None if payload is None else json.dumps(payload).encode('utf-8')
         req = Request(self.settings.engine_url.rstrip('/') + path, data=body,
                       headers={'Content-Type': 'application/json'}, method='GET' if body is None else 'POST')
-        with self._http.open(req, timeout=10) as response:
+        with self._http.open(req, timeout=self.settings.engine_timeout) as response:
             raw = response.read()
         return json.loads(raw) if raw else {}
 
@@ -87,7 +90,7 @@ class ComfyEngine:
             self._log_file.close()
         self._log_file = open(self.settings.data_dir / 'engine.log', 'ab', buffering=0)
         port = str(urlparse(self.settings.engine_url).port or 8188)
-        executable = root / '.venv/Scripts/python.exe'
+        executable = Path(self.settings.inference_python) if self.settings.inference_python else Path(sys.executable)
         isolated = root / '.runtime/inference-python/python.exe'
         bootstrap = root / '.runtime/inference-python/bootstrap'
         if isolated.is_file() and (bootstrap / 'sitecustomize.py').is_file():
@@ -166,6 +169,18 @@ class ComfyEngine:
         graph['10']['inputs']['filename_prefix'] = 'platform_' + job['id']
         return graph
 
+    def _result_bytes(self, filename, subfolder, output):
+        """Local engines expose the file under output/; remote engines must be downloaded via /view."""
+        if self._remote:
+            query = urlencode({'filename': filename, 'subfolder': subfolder, 'type': 'output'})
+            req = Request(self.settings.engine_url.rstrip('/') + '/view?' + query)
+            with self._http.open(req, timeout=self.settings.engine_timeout) as response:
+                return response.read()
+        source = (output / subfolder / filename).resolve()
+        if not source.is_relative_to(output) or not source.is_file():
+            raise EngineError('生成结果无效，请联系管理员。')
+        return source.read_bytes()
+
     def save_result(self, job, history, elapsed):
         status = history.get('status', {})
         if status.get('status_str') != 'success' or status.get('completed') is not True:
@@ -179,18 +194,20 @@ class ComfyEngine:
         if not isinstance(filename, str) or '/' in filename or '\\' in filename or filename in ('.', '..'):
             raise EngineError('生成结果无效，请联系管理员。')
         output = (self.settings.root / 'output').resolve()
-        source = (output / subfolder / filename).resolve()
-        if not source.is_relative_to(output) or not source.is_file():
-            raise EngineError('生成结果无效，请联系管理员。')
         try:
-            with Image.open(source) as image:
-                if image.format != 'PNG' or image.size != job_dimensions(job):
-                    raise ValueError('Unexpected PNG dimensions')
-                image.verify()
+            data = self._result_bytes(filename, subfolder, output)
             self.workflow(job)  # validates id before constructing a private destination
             dest = self.settings.data_dir / 'images' / (job['id'] + '.png')
             temporary = dest.with_suffix('.png.part')
-            shutil.copyfile(source, temporary)
+            temporary.write_bytes(data)
+            try:
+                with Image.open(temporary) as image:
+                    if image.format != 'PNG' or image.size != job_dimensions(job):
+                        raise ValueError('Unexpected PNG dimensions')
+                    image.verify()
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
             temporary.replace(dest)
             return dict(image_path='images/' + dest.name,
                         image_sha256=hashlib.sha256(dest.read_bytes()).hexdigest(), elapsed_seconds=round(elapsed, 3))

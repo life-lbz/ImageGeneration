@@ -1,4 +1,6 @@
-models/
+# Model weights live on the GPU host (autoDL); only the guide is tracked.
+/models/*
+!/models/模型说明.md
 output/
 user/
 .venv/
@@ -48,3 +50,4 @@ platform/frontend/FRONTEND-VERIFICATION.json
 **/*.[mM][aA][rR][kK][dD][oO][wW][nN]
 **/*.[mM][dD][xX]
 !/README.md
+!/models/模型说明.md
