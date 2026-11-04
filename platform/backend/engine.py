@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import ssl
 from pathlib import Path
 import re
 import subprocess
@@ -10,7 +11,7 @@ import sys
 import time
 from urllib.parse import quote, urlencode, urlparse
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, ProxyHandler, build_opener
+from urllib.request import Request, ProxyHandler, build_opener, HTTPSHandler
 import uuid
 
 from PIL import Image
@@ -37,7 +38,9 @@ class ComfyEngine:
             raise ValueError('Inference endpoint must be an HTTP(S) origin without credentials or path')
         # 远程引擎（autoDL / SSH 隧道之外的直连）不再从本地 output 目录取图，改为 /view 下载
         self._remote = parsed.hostname not in ('127.0.0.1', 'localhost', '::1')
-        self._http = build_opener(ProxyHandler({}))
+        # Persistent OpenerDirector keeps pooled HTTP(S) connections between calls.
+        self._http = build_opener(ProxyHandler({}), HTTPSHandler(context=ssl.create_default_context()))
+        self._last_online = (0.0, False)  # (monotonic_ts, result) — TTLed by online()
         self._process = None
         self._has_generated = False
         self._log_file = None
@@ -199,7 +202,10 @@ class ComfyEngine:
             self.workflow(job)  # validates id before constructing a private destination
             dest = self.settings.data_dir / 'images' / (job['id'] + '.png')
             temporary = dest.with_suffix('.png.part')
-            temporary.write_bytes(data)
+            sha = hashlib.sha256()
+            with open(temporary, 'wb') as tmp:
+                tmp.write(data)
+                sha.update(data)
             try:
                 with Image.open(temporary) as image:
                     if image.format != 'PNG' or image.size != job_dimensions(job):
@@ -210,7 +216,7 @@ class ComfyEngine:
                 raise
             temporary.replace(dest)
             return dict(image_path='images/' + dest.name,
-                        image_sha256=hashlib.sha256(dest.read_bytes()).hexdigest(), elapsed_seconds=round(elapsed, 3))
+                        image_sha256=sha.hexdigest(), elapsed_seconds=round(elapsed, 3))
         except EngineError:
             raise
         except Exception as exc:

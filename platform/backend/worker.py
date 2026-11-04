@@ -37,6 +37,7 @@ def finish(db, job_id, result):
 
 def run_worker(db, settings, stop_event):
     engine = ComfyEngine(settings)
+    _mark(db, 'running', None)
     try:
         recovered = False
         while not stop_event.is_set():
@@ -54,7 +55,6 @@ def run_worker(db, settings, stop_event):
                     recovered = True
                 if stop_event.is_set():
                     break
-                # Other local clients can use ComfyUI; do not overlap or interrupt their jobs.
                 queue = engine.queue()
                 if queue['queue_running'] or queue['queue_pending']:
                     stop_event.wait(1)
@@ -65,13 +65,25 @@ def run_worker(db, settings, stop_event):
                     continue
                 execute(db, engine, item, stop_event)
             except EngineUnsafe as exc:
+                _mark(db, f'engine_error', str(exc))
                 log.error('Worker halted safely: %s', exc)
                 return
-            except Exception:
+            except Exception as exc:
+                _mark(db, f'fatal', str(exc))
                 log.exception('Worker polling error')
                 stop_event.wait(1)
     finally:
+        _mark(db, 'stopped', None)
         engine.close()
+
+
+def _mark(db, status, last_error):
+    """Worker heartbeats/status land in meta so other endpoints can query safely."""
+    try:
+        db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',
+                   ('worker_status', status + (f' | {last_error}' if last_error else '')))
+    except Exception:
+        pass  # meta 表不存在或临时锁争用不影响主流程
 
 
 def execute(db, engine, item, stop_event, resume=False):

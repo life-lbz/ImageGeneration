@@ -1,10 +1,12 @@
 import asyncio
 import hmac
 import logging
+import os
 import secrets
 import sqlite3
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,13 +15,16 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from starlette.responses import JSONResponse
 
 from .config import Settings
 from .db import Database
+from .engine import ComfyEngine
 from .formats import ASPECT_SIZES, SIZE_ASPECTS, job_dimensions
 from .security import bootstrap_admin, check_password, create_user, hash_password, now, token_hash
 
 COOKIE = 'moss_session'
+log = logging.getLogger(__name__)
 
 
 class Login(BaseModel):
@@ -82,11 +87,12 @@ def create_app(settings=None):
     async def lifespan(app):
         thread = None
         lock_file = None
+        app.state.engine = ComfyEngine(settings)
         if settings.worker_enabled:
             # One process per SQLite worker. A second instance must fail closed.
             lock_file = open(settings.data_dir / 'worker.lock', 'a+b')
             try:
-                if __import__('os').name == 'nt':
+                if os.name == 'nt':
                     import msvcrt
                     lock_file.seek(0)
                     if not lock_file.read(1):
@@ -114,6 +120,7 @@ def create_app(settings=None):
                 await asyncio.to_thread(thread.join)
             if lock_file:
                 lock_file.close()
+            app.state.engine.close()
 
     app = FastAPI(title='MOSS Studio', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.db = db
@@ -121,11 +128,28 @@ def create_app(settings=None):
     app.state.worker_thread = None
 
     @app.middleware('http')
-    async def trust_boundary(request, call_next):
+    async def request_logger(request: Request, call_next):
+        rid = uuid.uuid4().hex[:12]
+        request.state.request_id = rid
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except HTTPException:
+            raise
+        except Exception:
+            log.exception('Unhandled exception on %s %s rid=%s', request.method, request.url.path, rid)
+            response = JSONResponse({'detail': '服务内部错误', 'request_id': rid}, status_code=500)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        log.info('%s %s %d rid=%s %.1fms', request.method, request.url.path, response.status_code, rid, elapsed_ms)
+        response.headers['X-Request-Id'] = rid
+        return response
+
+    @app.middleware('http')
+    async def trust_boundary(request: Request, call_next):
         origin = request.headers.get('origin')
         if request.method not in ('GET', 'HEAD', 'OPTIONS'):
             if (origin and origin not in settings.allowed_origins) or request.headers.get('sec-fetch-site') == 'cross-site':
-                return __import__('starlette.responses', fromlist=['JSONResponse']).JSONResponse({'detail': '请求来源不受信任'}, status_code=403)
+                return JSONResponse({'detail': '请求来源不受信任'}, status_code=403)
         response = await call_next(request)
         response.headers['Cache-Control'] = 'no-store'
         response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -179,6 +203,32 @@ def create_app(settings=None):
                       queue_position=ids.index(job['id']) + 1 if job['id'] in ids else None)
         return result
 
+    @app.get('/health')
+    async def health(request: Request):
+        db_ok = True
+        try:
+            db.one('SELECT 1')
+        except sqlite3.Error as exc:
+            db_ok = False
+            log.warning('health: db probe failed: %s', exc)
+        # ComfyEngine.online() 是同步 HTTP，丢到线程池避免阻塞 uvicorn worker 线程。
+        engine_ok = await asyncio.to_thread(app.state.engine.online)
+        worker_meta = db.one("SELECT value FROM meta WHERE key='worker_status'")
+        worker_status = (worker_meta['value'] if worker_meta else None) if worker_meta else None
+        worker_ok = True
+        if settings.worker_enabled:
+            if not app.state.worker_thread or not app.state.worker_thread.is_alive():
+                worker_ok = False
+            elif worker_status and worker_status.startswith(('engine_error', 'fatal')):
+                worker_ok = False
+        status = 200 if (db_ok and engine_ok and worker_ok) else 503
+        return JSONResponse(
+            {'status': 'ok' if status == 200 else 'degraded',
+             'db': db_ok, 'engine': engine_ok, 'worker': worker_ok, 'worker_status': worker_status,
+             'request_id': getattr(request.state, 'request_id', None)},
+            status_code=status,
+        )
+
     @app.get('/api/auth/bootstrap')
     def bootstrap_status():
         pending = db.one("SELECT id FROM users WHERE username='admin' AND role='admin' AND is_active=1 AND must_change_password=1")
@@ -189,10 +239,11 @@ def create_app(settings=None):
         key = request.client.host if request.client else 'local'
         with limiter_lock:
             bucket = attempts[key]
-            while bucket and bucket[0] < time.time() - 600:
+            window_expire = time.time() - settings.login_rate_window
+            while bucket and bucket[0] < window_expire:
                 bucket.popleft()
-            if len(bucket) >= 20:
-                raise HTTPException(429, '登录尝试过多，请10分钟后再试')
+            if len(bucket) >= settings.login_rate_max:
+                raise HTTPException(429, f'登录尝试过多，请{settings.login_rate_window // 60}分钟后再试')
             bucket.append(time.time())
         user = db.one('SELECT * FROM users WHERE username=?', (body.username,))
         # Do a comparable hash operation for nonexistent users to reduce enumeration.
@@ -245,11 +296,17 @@ def create_app(settings=None):
         return {'user':public_user(updated),'csrf_token':csrf}
 
     @app.get('/api/status')
-    def status(user=Depends(current)):
-        from .engine import ComfyEngine
-        return {'engine_online': ComfyEngine(settings).online(), 'queue_length': db.one("SELECT count(*) AS n FROM jobs WHERE status='queued'")['n'],
-                'running': bool(db.one("SELECT id FROM jobs WHERE status='running'")), 'model': 'MOSS-Image INT8', 'max_concurrency': 1,
-                'worker_online': bool(app.state.worker_thread and app.state.worker_thread.is_alive())}
+    async def status(user=Depends(current)):
+        engine_online = await asyncio.to_thread(app.state.engine.online)
+        worker_meta = db.one("SELECT value FROM meta WHERE key='worker_status'")
+        worker_status = worker_meta['value'] if worker_meta else None
+        return {'engine_online': engine_online,
+                'queue_length': db.one("SELECT count(*) AS n FROM jobs WHERE status='queued'")['n'],
+                'running': bool(db.one("SELECT id FROM jobs WHERE status='running'")),
+                'model': 'MOSS-Image INT8', 'max_concurrency': 1,
+                'worker_online': bool(app.state.worker_thread and app.state.worker_thread.is_alive()
+                                       and not (worker_status and worker_status.startswith(('engine_error', 'fatal')))),
+                'worker_status': worker_status}
 
     @app.get('/api/jobs')
     def jobs(page: Annotated[int, Query(ge=1)] = 1, page_size: Annotated[int, Query(ge=1, le=50)] = 12,
