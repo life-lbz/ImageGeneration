@@ -6,7 +6,7 @@
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$python = if ($env:MOSS_PYTHON) { $env:MOSS_PYTHON } else { 'D:\Developers\Anaconda3\envs\image_generation\python.exe' }
+$python = if ($env:MOSS_PYTHON) { $env:MOSS_PYTHON } else { (Get-Command python -ErrorAction Stop).Source }
 $frontend = Join-Path $root 'platform\frontend'
 if (!(Test-Path -LiteralPath $python)) { throw '请先按 platform/README.md 安装平台独立环境。' }
 

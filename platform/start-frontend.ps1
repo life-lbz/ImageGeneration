@@ -4,7 +4,7 @@ $frontend = Join-Path $PSScriptRoot 'frontend'
 $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
 $node = if ($nodeCommand) { $nodeCommand.Source } else { $null }
 if (!$node) {
-    foreach ($candidate in @('E:\nodejs\node.exe', (Join-Path $env:ProgramFiles 'nodejs\node.exe'))) {
+    foreach ($candidate in @((Join-Path $env:ProgramFiles 'nodejs\node.exe'), (Join-Path ${env:ProgramFiles(x86)} 'nodejs\node.exe'))) {
         if (Test-Path -LiteralPath $candidate) { $node = $candidate; break }
     }
 }
